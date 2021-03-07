@@ -29,9 +29,9 @@ except ImportError:
 #
 # SETTINGS
 #
-DEBUG = '{{ DEBUG }}'
-SYSLOG = '{{ SYSLOG }}'
-DATA_URL = '{{ DATA_URL}}'
+DEBUG = '{{ DEBUG }}'  # Set to `'True'` for generating debugging logging, otherwise set to `'False'`
+SYSLOG = '{{ SYSLOG }}'  # Indicate the IP address of a syslog server, or false otherwise
+DATA_URL = '{{ DATA_URL}}'  # Indicate the URL address of the configuration JSON data file
 
 #
 # DEVELOPMENT CONSTANTS
@@ -44,6 +44,10 @@ VERSION = '(under development)'
 #
 def remove_leading_zeroes(version):
     return re.sub(r'\b0+(\d)', r'\1', version)
+
+
+def _make_comparable(value):
+    return re.sub(r'[\W_]+', '', value).lower()
 
 
 #
@@ -174,8 +178,7 @@ class Logger(object):
             Logger._buffer += out_line
 
             if Logger.syslog and not _skip_syslog:
-                severity = min(severity, Logger.Severity.DEBUG)
-                command = ('send log %d "%s"' % (severity, line))
+                command = ('send log %d "%s"' % (min(severity, Logger.Severity.DEBUG), line))
                 # noinspection PyBroadException
                 try:
                     cli.execute(command)
@@ -238,6 +241,30 @@ class Device(object):
     reordering stack members (when it applies), ...
     """
 
+    class Keys:
+        CHASSIS = 'CHASSIS'
+        DESCRIPTION = 'DESCRIPTION'
+        HW_VERSION = 'HW_VERSION'
+        ID = 'ID'
+        MAC = 'MAC'
+        PID = 'PID'
+        PRIORITY = 'PRIORITY'
+        ROLE = 'ROLE'
+        SERIAL = 'SERIAL'
+        STATE = 'STATE'
+        VID = 'VID'
+
+        sortable_keys = [ID, MAC, SERIAL]
+
+    class StackSortingOrder:
+        ASCENDING = 'ASCENDING'
+        DESCENDING = 'DESCENDING'
+
+    class Beacon:
+        ALL_LEDS = 'ALL'
+        EVEN_LEDS = 'EVEN'
+        ODD_LEDS = 'ODD'
+
     TRANSFER_RETRIES = 3
 
     def __init__(self):
@@ -265,11 +292,11 @@ class Device(object):
         return self._members
 
     @property
-    def is_chassis(self):
+    def is_stackable(self):
         if self._members is None:
             self._read_inventory()
 
-        return bool(0 in self._members)
+        return not bool(0 in self._members)
 
     @property
     def version(self):
@@ -292,11 +319,11 @@ class Device(object):
             Logger.dev('Device.load(): file_url="%s", encoding="%s"' % (src_url, encoding))
 
             response = ''
-            for retry in range(Device.TRANSFER_RETRIES):
+            for attempt in range(Device.TRANSFER_RETRIES):
                 Logger.notice('Loading "%s" (attempt: %d/%d)' %
-                              (src_url, retry + 1, Device.TRANSFER_RETRIES))
+                              (src_url, attempt + 1, Device.TRANSFER_RETRIES))
 
-                response = cli.execute('more %s' % src_url)
+                response = Device.execute('more %s' % src_url)
                 match = re.match('^(%Error .*)', response)
                 if match:
                     Logger.error('Error while loading file "%s"' % src_url)
@@ -365,7 +392,7 @@ class Device(object):
         # Checksum verification
         if sha512 or md5:
             Logger.notice('Verifying %s checksum.' % ('SHA512' if sha512 else 'MD5'))
-            response = cli.execute('verify /%s flash:/%s' % ('sha512' if sha512 else 'md5', filename))
+            response = Device.execute('verify /%s flash:/%s' % ('sha512' if sha512 else 'md5', filename))
 
             checksum = re.search('([a-fA-F0-9]{%d})' % (128 if sha512 else 32), response).group(1).strip().lower()
             if not (sha512 and checksum == sha512.strip().lower()) and not (md5 and checksum == md5.strip().lower()):
@@ -381,27 +408,120 @@ class Device(object):
         members = self.members
         for i in members.keys():
             member = members[i]
-            if member['role'] == 'Active':
-                Logger.informational('Member %d has role Active. Firmware not copied.' % member['id'])
+            if member[Device.Keys.ROLE] == 'Active':
+                Logger.informational('Member %s has role Active. Firmware not copied.' % member[Device.Keys.ID])
                 continue
 
-            if member['state'] == 'Provisionned':
-                Logger.informational('Member %d is in state Provisionned. Firmware not copied.' % member['id'])
+            if member[Device.Keys.STATE] == 'Provisionned':
+                Logger.informational('Member %s is in state Provisionned. Firmware not copied.'
+                                     % member[Device.Keys.ID])
                 continue
 
-            Logger.notice('Copying firmware to stack member %d' % member['id'])
-            cli.execute("copy flash:/%s flash-%d:/%s" % (filename, member['id'], filename))
+            Logger.notice('Copying firmware to stack member %s' % member[Device.Keys.ID])
+            Device.execute("copy flash:/%s flash-%s:/%s" % (filename, member[Device.Keys.ID], filename))
 
         # Make this image bootable
         Logger.notice('Making "%s" the boot image' % filename)
-        cli.configure('no boot system switch all')
-        cli.configure('boot system switch all flash:/%s' % filename)
+        Device.configure('no boot system switch all')
+        Device.configure('boot system switch all flash:/%s' % filename)
 
         # Copy and delete configuration to ensure the boot settings are applied
-        cli.execute('copy running-config startup-config')
-        cli.execute('erase nvram:')
+        Device.execute('copy running-config startup-config')
+        Device.execute('erase nvram:')
 
         Logger.dev('Device.upgrade(): leaving')
+
+    # noinspection PyUnusedLocal
+    def configure_stack_members(self, keys=Keys.MAC, order=StackSortingOrder.ASCENDING, **kwargs):
+        """
+        Configure the stack members.
+
+        :param keys: the keys used to determine the ordering of the stack members, can be 'MAC' (the default),
+        'SERIAL', or 'ID'
+        :param order: the ordering of the stack members, can be 'ASCENDING', 'DESCENDING' or a comma-separated list of
+        key values
+        :return: `None`
+        """
+        Logger.dev('Device.configure_stack_members(): entering')
+        Logger.dev('Device.configure_stack_members(): keys="%s"' % keys)
+        Logger.dev('Device.configure_stack_members(): order="%s"' % order)
+
+        if not self.is_stackable:
+            Logger.error('Device seems not to be a stack. Stack configuration aborted...')
+            Logger.debug('is_stackable = %s' % str(self.is_stackable))
+            Logger.dev('Device.configure_stack_members(): leaving')
+            return
+
+        Logger.notice('Renumbering stack members')
+
+        if keys not in Device.Keys.sortable_keys:
+            Logger.error('Invalid value for "keys" given in "stack" configuration (received value: "%s").'
+                         ' Aborting stack renumbering...' % keys)
+            Logger.dev('Device.configure_stack_members(): leaving')
+            return
+
+        members = self.members
+
+        # List of indices of members in current order
+        current_order = [index for index in members.keys()]
+
+        # Determine the target order
+        target_order = []
+        if order in [Device.StackSortingOrder.ASCENDING, Device.StackSortingOrder.DESCENDING]:
+            # Use device properties to determine the target order
+            if keys == Device.Keys.ID:
+                target_order = sorted(members.keys())
+            else:
+                target_order = sorted(members, key=lambda index: members[index][keys])
+
+            if order == Device.StackSortingOrder.DESCENDING:
+                target_order.reverse()
+        else:
+            all_devices = sorted(members.keys())
+            order_list = order.split(',')
+
+            if keys == Device.Keys.ID:
+                for item in order_list:
+                    try:
+                        idx = int(item)
+                        if idx in all_devices:
+                            target_order.append(idx)
+                        else:
+                            Logger.error('ID provided in stack.order list does not represent an existing member'
+                                         ' (invalid ID: %d). Ignoring value.' % idx)
+                    except ValueError as ex:
+                        Logger.error('Invalid ID provided in stack.order list (invalid ID: "%s"). Ignoring value'
+                                     % item)
+            else:
+                for item in order_list:
+                    index = None
+                    for idx, member in members.items():
+                        if _make_comparable(member[keys]) == _make_comparable(item):
+                            index = idx
+                            break
+                    if index:
+                        target_order.append(index)
+                    else:
+                        Logger.error('%s provided in stack.order list does not represent an existing equipment'
+                                     ' (invalid %s: %s). Ignoring value.' % (keys, keys, item))
+
+            # Remove possible duplicates
+            target_order = list(dict.fromkeys(target_order))
+
+            # Add possible devices that are not included in stack.order
+            missing_devices = sorted(list(set(all_devices) - set(target_order)))
+            target_order += missing_devices
+
+        for i, idx in enumerate(target_order):
+            Logger.informational('Processing member %d (MAC: %s; Serial: %s). Set ID=%d, priority=%d' %
+                                 (idx, members[idx][Device.Keys.MAC], members[idx][Device.Keys.SERIAL],
+                                  i+1, max(15-i, 1)))
+
+            Device.execute('switch %d renumber %d' % (idx, i+1))
+            Device.execute('switch %d priority %d' % (idx, max(15-i, 1)))
+            Device.execute('delete flash-%d:nvram_config*' % idx)
+
+        Logger.dev('Device.configure_stack_members(): leaving')
 
     def download(self, src_url, dst_url):
         # noinspection PyPep8Naming
@@ -409,9 +529,9 @@ class Device(object):
 
         for attempt in range(Device.TRANSFER_RETRIES):
             Logger.notice('Downloading "%s" to "%s" (attempt: %d/%d)' %
-                          (src_url, dst_url, attempt, Device.TRANSFER_RETRIES))
+                          (src_url, dst_url, attempt + 1, Device.TRANSFER_RETRIES))
 
-            response = cli.execute('copy %s %s' % (src_url, dst_url))
+            response = Device.execute('copy %s %s' % (src_url, dst_url))
             match = ERROR_RE.search(response)
             if match:
                 Logger.error('Error while downloading file "%s"' % src_url)
@@ -420,10 +540,42 @@ class Device(object):
                 return True
         return False
 
+    def beacon_on(self, nodes):
+        """ Turns on blue beacon of given switch number list, if supported. """
+        self._beacon(nodes, True)
+
+    def beacon_off(self, nodes):
+        """ Turns off blue beacon of given switch number list, if supported. """
+        self._beacon(nodes, False)
+
+    def _beacon(self, nodes, state):
+        if nodes == Device.Beacon.ALL_LEDS:
+            nodes = list(self.members.keys())
+        elif nodes == Device.Beacon.EVEN_LEDS:
+            nodes = list(filter(lambda key: key % 2 == 0, self.members.keys()))
+        elif nodes == Device.Beacon.ODD_LEDS:
+            nodes = list(filter(lambda key: key % 2 == 1, self.members.keys()))
+
+        if not isinstance(nodes, list):
+            Logger.error('Invalid value given to beacon_on() or beacon_off()')
+            Logger.debug('nodes = %s' % str(nodes))
+            return
+
+        for index in nodes:
+            on_off = 'on' if state else 'off'
+
+            # Up to and including 16.8.x
+            Device.cli('configure terminal ; hw-module beacon %s switch %d' % (on_off, index))
+
+            # From 16.9.x onwards
+            Device.execute('hw-module beacon slot %d %s' % (index, on_off))
+
+            Logger.informational('Switch %d beacon LED turned %s' % (index, on_off))
+
     def _read_inventory(self):
         """ Read the device inventory and store it in the self.inventory dict. """
 
-        xml_inventory = cli.execute('show inventory | format')
+        xml_inventory = Device.execute('show inventory | format')
         dom_inventory = minidom.parseString(xml_inventory)
 
         self._inventory = []
@@ -431,43 +583,43 @@ class Device(object):
         self._serials = []
         for entry in dom_inventory.getElementsByTagName('InventoryEntry'):
             record = {
-                'chassis': entry.getElementsByTagName('ChassisName')[0].firstChild.data,
-                'description': entry.getElementsByTagName('Description')[0].firstChild.data,
-                'pid': entry.getElementsByTagName('PID')[0].firstChild.data,
-                'vid': entry.getElementsByTagName('VID')[0].firstChild.data,
-                'serial': (entry.getElementsByTagName('SN')[0].firstChild.data
-                           if hasattr(entry.getElementsByTagName('SN')[0].firstChild, 'data') else ''),
+                Device.Keys.CHASSIS: entry.getElementsByTagName('ChassisName')[0].firstChild.data,
+                Device.Keys.DESCRIPTION: entry.getElementsByTagName('Description')[0].firstChild.data,
+                Device.Keys.PID: entry.getElementsByTagName('PID')[0].firstChild.data,
+                Device.Keys.VID: entry.getElementsByTagName('VID')[0].firstChild.data,
+                Device.Keys.SERIAL: (entry.getElementsByTagName('SN')[0].firstChild.data
+                                     if hasattr(entry.getElementsByTagName('SN')[0].firstChild, 'data') else ''),
             }
             self._inventory += [record]
 
-            if record['chassis'] == '"Chassis"':
-                record['id'] = 0
+            if record[Device.Keys.CHASSIS] == '"Chassis"':
+                record[Device.Keys.ID] = 0
                 self._members[0] = record
-                self._serials.append(record['serial'])
+                self._serials.append(record[Device.Keys.SERIAL])
 
-            match = re.match('"Switch ([0-9])"', record['chassis'])
-            if match and record['serial']:
+            match = re.match(r'"Switch ([0-9])"', record[Device.Keys.CHASSIS])
+            if match and record[Device.Keys.SERIAL]:
                 unit = int(match.group(1))
-                record['id'] = unit
+                record[Device.Keys.ID] = str(unit)  # Enforce ID to be a string
                 self._members[unit] = record
-                self._serials.append(record['serial'])
+                self._serials.append(record[Device.Keys.SERIAL])
 
-        response = cli.execute('show switch')
+        response = Device.execute('show switch')
         members = [x.groupdict() for x in re.finditer(
-            r'^[\s*](?P<id>[1-9]+)\s+(?P<role>(\bStandby\b)|(\bActive\b)|(\bMember\b))\s+(?P<mac>([0-9a-f]{4}\.){2}'
-            r'[0-9a-f]{4})\s+(?P<priority>[0-9]+)\s+(?P<hw_version>V[0-9]+)\s+(?P<state>\S.*\S)\s+$',
+            r'^[\s*](?P<ID>[1-9]+)\s+(?P<ROLE>(\bStandby\b)|(\bActive\b)|(\bMember\b))\s+(?P<MAC>([0-9a-f]{4}\.){2}'
+            r'[0-9a-f]{4})\s+(?P<PRIORITY>[0-9]+)\s+(?P<HW_VERSION>V[0-9]+)\s+(?P<STATE>\S.*\S)\s+$',
             response, re.MULTILINE)]
 
         for record in members:
-            unit = int(record['id'])
-            del record['id']
+            unit = int(record[Device.Keys.ID])
+            del record[Device.Keys.ID]
             if unit in self._members:
                 self._members[unit] = {**self._members[unit], **record}
 
     def _read_version(self):
         """ Returns a string with the IOS XE version. """
 
-        response = cli.execute('show version')
+        response = Device.execute('show version')
 
         match = re.search('Version ([A-Za-z0-9.:()]+)', response)
         # remove leading zeroes from numbers
@@ -478,7 +630,7 @@ class Device(object):
 
     def _is_iosxe_package(self, url, raise_exception_when_error=True):
         """ Returns True if the given file is an IOS XE package """
-        output = cli.execute('show file information %s' % url)
+        output = Device.execute('show file information %s' % url)
 
         # log error message if any and terminate script in case of failure
         match = re.match('^(%Error .*)', output)
@@ -494,6 +646,84 @@ class Device(object):
         match = re.findall(r'\S{8}: +(\S{8} +\S{8} +\S{8} +\S{8})', data)
         parts = [base64.b16decode(re.sub('[ X]', '', line)).decode(encoding) for line in match]
         return ''.join(parts) if match else data
+
+    @staticmethod
+    def cli(commands, display=False):
+        result = ''
+
+        if isinstance(commands, str):
+            commands = [commands]
+        if not isinstance(commands, list):
+            return result
+
+        for command in commands:
+            Logger.dev('COMMAND: [CLI] %s' % command)
+            try:
+                response = cli.cli(command)
+                result += response
+                if display:
+                    print(response)
+                if response.strip() != '':
+                    Logger.dev('%s\n%s\n%s\n' % (80 * 'v', response, 80 * '^'))
+            except Exception as ex:
+                Logger.dev('ERROR:\n%s\n%s\n%s\n' % (80 * 'v', ex, 80 * '^'))
+                Logger.error('Error while sending command "%s" to IOS' % command)
+                Logger.debug(ex)
+
+        return result
+
+    @staticmethod
+    def clip(commands):
+        return Device.cli(commands, True)
+
+    @staticmethod
+    def configure(commands):
+        if isinstance(commands, str):
+            commands = [commands]
+        if not isinstance(commands, list):
+            return
+
+        for command in commands:
+            Logger.dev('COMMAND: [CONFIG] %s' % command)
+            try:
+                cli.configure(command)
+            except Exception as ex:
+                Logger.dev('ERROR:\n%s\n%s\n%s\n' % (80 * 'v', ex, 80 * '^'))
+                Logger.error('Error while sending command "%s" to IOS' % command)
+                Logger.debug(ex)
+
+    @staticmethod
+    def configurep(commands):
+        return Device.configure(commands)
+
+    @staticmethod
+    def execute(commands, display=False):
+        result = ''
+
+        if isinstance(commands, str):
+            commands = [commands]
+        if not isinstance(commands, list):
+            return result
+
+        for command in commands:
+            Logger.dev('COMMAND: [EXEC] %s' % command)
+            try:
+                response = cli.execute(command)
+                result += response
+                if display:
+                    print(response)
+                if response.strip() != '':
+                    Logger.dev('%s\n%s\n%s\n' % (80 * 'v', response, 80 * '^'))
+            except Exception as ex:
+                Logger.dev('ERROR:\n%s\n%s\n%s\n' % (80 * 'v', ex, 80 * '^'))
+                Logger.error('Error while sending command "%s" to IOS' % command)
+                Logger.debug(ex)
+
+        return result
+
+    @staticmethod
+    def executep(commands):
+        return Device.execute(commands, True)
 
 
 class App(object):
@@ -523,17 +753,14 @@ class App(object):
     def run(self):
         if not self._data:
             # We have no data to process...
-            # Let's turn all beacon blue LEDs (if any)
-            # and let the device reload in 30 minutes
             Logger.emergency('No configuration data loaded: No instructions to process further!')
             Logger.emergency('Device will reload in 30 minutes and execute ZTP process again...')
 
-            # TODO: IMPLEMENT FOLLOWING COMMANDS
-            # self._device.execute('reload in 30')
-            # self._device.beacon_on()
+            Device.execute('reload in 30')
+            self._device.beacon_on(Device.Beacon.ALL_LEDS)
             return
 
-        self._stack_renumbering()
+        self._stack_members_configuration()
         self._software_upgrade()
         # self._process_configuration (sequences -> commands -> configuration file -> commands, ...)
         # save configuration ?
@@ -541,12 +768,13 @@ class App(object):
         # send log buffer
         # release syslog
 
-    def _stack_renumbering(self):
+    def _stack_members_configuration(self):
         data = self._data
         if 'stack' not in data:
             Logger.debug('Configuration JSON data does not provide stacking indication. Skipped...')
+            return
 
-        # TODO: Implement logic
+        self._device.configure_stack_members(**data['stack'])
 
     def _software_upgrade(self):
         data = self._data
@@ -590,7 +818,6 @@ def main():
     :return: `None`
     """
     global DEBUG, SYSLOG, DATA_URL
-
     DEBUG = DEBUG.capitalize() == 'True'
     SYSLOG = SYSLOG or None
     DATA_URL = DATA_URL or None
