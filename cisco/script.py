@@ -31,12 +31,13 @@ except ImportError:
 #
 DEBUG = '{{ DEBUG }}'  # Set to `'True'` for generating debugging logging, otherwise set to `'False'`
 SYSLOG = '{{ SYSLOG }}'  # Indicate the IP address of a syslog server, or false otherwise
-DATA_URL = '{{ DATA_URL}}'  # Indicate the URL address of the configuration JSON data file
+DATA_URL = '{{ DATA_URL }}'  # Indicate the URL address of the configuration JSON data file
 
 #
 # DEVELOPMENT CONSTANTS
 #
 VERSION = '(under development)'
+DEVELOPMENT = True
 
 
 #
@@ -98,7 +99,6 @@ class Logger(object):
 
     _severity = Severity.INFORMATIONAL
     _syslog = None
-    _buffer = []
 
     @staticmethod
     def syslog():
@@ -173,9 +173,7 @@ class Logger(object):
             return
 
         for line in str(message).splitlines():
-            out_line = '[%s] %s' % (Logger.Severity.labels[severity], line)
-            print(out_line)
-            Logger._buffer += out_line
+            print('[%s] %s' % (Logger.Severity.labels[severity], line))
 
             if Logger.syslog and not _skip_syslog:
                 command = ('send log %d "%s"' % (min(severity, Logger.Severity.DEBUG), line))
@@ -593,7 +591,7 @@ class Device(object):
             self._inventory += [record]
 
             if record[Device.Keys.CHASSIS] == '"Chassis"':
-                record[Device.Keys.ID] = 0
+                record[Device.Keys.ID] = '0'  # Enforce ID to be a string
                 self._members[0] = record
                 self._serials.append(record[Device.Keys.SERIAL])
 
@@ -727,17 +725,20 @@ class Device(object):
 
 
 class App(object):
-    def __init__(self, data_url=None, syslog=None, debug=False):
+    def __init__(self, data_url=None, syslog=None, debug=False, _development=False):
         self._data_url = data_url
         self._syslog = syslog
         self._debug = debug
+        self._development = _development
 
         self._data = None
+        self._save = False
+        self._reload = None
+        self._exit_value = 0
 
         Logger.syslog(syslog)
         if self._debug:
-            # TODO: Fix to DEBUG for production
-            Logger.severity(Logger.Severity.DEV)
+            Logger.severity(Logger.Severity.DEBUG if not self._development else Logger.Severity.DEVELOPMENT)
 
         Logger.notice('Cisco IOS-XE ZTP script started, version %s' % VERSION)
         self._device = Device()
@@ -751,22 +752,69 @@ class App(object):
         self._download_data()
 
     def run(self):
-        if not self._data:
+        if self._data:
+            self._stack_members_configuration()
+            self._software_upgrade()
+            # self._process_configuration (sequences -> commands -> configuration file -> commands, ...)
+
+            self._save_configuration()
+            self._process_reload()
+        else:
             # We have no data to process...
             Logger.emergency('No configuration data loaded: No instructions to process further!')
-            Logger.emergency('Device will reload in 30 minutes and execute ZTP process again...')
-
-            Device.execute('reload in 30')
             self._device.beacon_on(Device.Beacon.ALL_LEDS)
+            # We set a reload delay of 30 minutes to prevent the device to get stuck in bootloader
+            # if excessive reloads occurs in a short time
+            self._reload = 30
+
+        self._shutdown()
+
+    def _get_querystring(self):
+        members = self._device.members
+
+        indices = list(members.keys())
+        macs = [members[member][Device.Keys.MAC] for member in members.keys()]
+        serials = [members[member][Device.Keys.SERIAL] for member in members.keys()]
+        models = [members[member][Device.Keys.PID] for member in members.keys()]
+
+        querystr_main = ''
+        querystr_macs = querystr_serials = querystr_models = ''
+        for i, index in enumerate(indices):
+            print('index = %d' % index)
+            if i == 0:
+                querystr_main = ('MAC=%s&SERIAL=%s&MODEL=%s&NB_MEMBERS=%d'
+                                 % (macs[i], serials[i], models[i], len(indices)))
+            else:
+                querystr_macs += '&'
+                querystr_serials += '&'
+                querystr_models += '&'
+            querystr_macs += 'MAC__%d=%s' % (index, macs[i])
+            querystr_serials += 'SERIAL__%d=%s' % (index, serials[i])
+            querystr_models += 'MODEL__%d=%s' % (index, models[i])
+        return '%s&%s&%s&%s' % (querystr_main, querystr_macs, querystr_serials, querystr_models)
+
+    def _download_data(self):
+        if not self._data_url:
+            self._data = None
             return
 
-        self._stack_members_configuration()
-        self._software_upgrade()
-        # self._process_configuration (sequences -> commands -> configuration file -> commands, ...)
-        # save configuration ?
-        # schedule reload ?
-        # send log buffer
-        # release syslog
+        url = '%s?%s' % (self._data_url, self._get_querystring())
+        json_data = self._device.load(url)
+        if not json_data:
+            self._data = None
+            return
+
+        try:
+            data = json.loads(json_data)
+        except json.JSONDecodeError as ex:
+            Logger.error('Loaded file is not a valid JSON file')
+            Logger.debug(ex)
+            return
+
+        self._data = data
+        Logger.dev('Data file downloaded:')
+        Logger.dev(data)
+        return data
 
     def _stack_members_configuration(self):
         data = self._data
@@ -788,27 +836,47 @@ class App(object):
 
         self._device.upgrade(**data['software'])
 
-    def _download_data(self):
-        if not self._data_url:
-            self._data = None
+    def _save_configuration(self):
+        data = self._data
+        if 'save' not in data:
+            Logger.debug('Configuration JSON data does not provide saving indication. Skipped...')
             return
 
-        json_data = self._device.load(self._data_url)
-        if not json_data:
-            self._data = None
+        self._save = (data['save'].capitalize() == 'True')
+
+    def _process_reload(self):
+        data = self._data
+        if 'reload' not in data:
+            Logger.debug('Configuration JSON data does not provide reload indication. Skipped...')
             return
 
-        try:
-            data = json.loads(json_data)
-        except json.JSONDecodeError as ex:
-            Logger.error('Loaded file is not a valid JSON file')
-            Logger.debug(ex)
-            return
+        if 'delay' not in data['reload']:
+            self._reload = 0
+        else:
+            try:
+                self._reload = int(data['reload']['delay'])
+            except ValueError:
+                self._reload = 0
 
-        self._data = data
-        Logger.dev('Data file downloaded:')
-        Logger.dev(data)
-        return data
+        if self._reload < 1:
+            # We set a 1 minute delay, so the script can properly exit
+            self._reload = 1
+
+    def _shutdown(self):
+        if self._save is True:
+            Logger.notice('Saving configuration')
+            self._device.execute('copy running-config startup-config')
+
+        if self._reload is not None:
+            # noinspection PyStringFormat
+            Logger.informational('Reloading the device in %d minute(s)' % self._reload)
+            # noinspection PyStringFormat
+            cli.execute('reload in %d' % self._reload)
+
+        Logger.syslog(None)
+
+        self._device = None
+        sys.exit(int(self._exit_value))
 
 
 def main():
@@ -817,12 +885,13 @@ def main():
 
     :return: `None`
     """
-    global DEBUG, SYSLOG, DATA_URL
+    global DEBUG, SYSLOG, DATA_URL, DEVELOPMENT
     DEBUG = DEBUG.capitalize() == 'True'
     SYSLOG = SYSLOG or None
     DATA_URL = DATA_URL or None
+    DEVELOPMENT = globals()['DEVELOPMENT'] if 'DEVELOPMENT' in globals() else False
 
-    app = App(data_url=DATA_URL, syslog=SYSLOG, debug=DEBUG)
+    app = App(data_url=DATA_URL, syslog=SYSLOG, debug=DEBUG, _development=DEVELOPMENT)
     app.run()
 
 

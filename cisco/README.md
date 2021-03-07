@@ -63,3 +63,35 @@ Note that both `sha512` and `md5` are optional. When both are missing, no file i
         "md5": "3cc37b28a564064485e767ebc3a1f2f8"
 }
 ```
+
+### Configuration saving
+At the end of the script execution, current configuration can be saved for persisting over reboot.
+
+Note that if you already applied some changes into the device `startup-config`, saving configuration will overwrite any previous changes.
+
+To indicate the script to save the current configuration, the JSON data must contain a string named `save` that contains the value `"True"`
+
+#### Example
+```
+{
+    "save": "True"
+}
+```
+
+### Device reload
+At the end of the script execution, the device can be reloaded. The configuation JSON data can indicate if the device has to be reloaded, and the delay for such reboot.
+
+In order to have the device reloaded, the JSON data must contain an object named `reload` (case is important):
+* `reload`: object indicating the device should reload at the end of the script execution
+  * `delay`: optional parameter indicating the delay, in minutes, between the end of the script and the reload is initiated (defaults to 1 minute - see the note below).
+
+Note that the script imposes a minimum delay of 1 minute, so it can properly finishes its execution.
+
+#### Example
+```
+{
+    "reload": {
+        "delay": 1
+    }
+}
+```
