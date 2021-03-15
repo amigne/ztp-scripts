@@ -7,7 +7,7 @@ As Cisco IOS XE uses both Python 2 and Python 3, depending on the IOS XE
 version, this script has to be compatible with both versions.
 
 Author:  Yann Gauteron
-Version: development
+Version: 0.0.1
 """
 import base64
 import cli
