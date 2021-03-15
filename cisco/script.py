@@ -36,7 +36,7 @@ DATA_URL = '{{ DATA_URL }}'  # Indicate the URL address of the configuration JSO
 #
 # DEVELOPMENT CONSTANTS
 #
-VERSION = '(under development)'
+VERSION = '0.0.1a'
 DEVELOPMENT = True
 
 
