@@ -330,7 +330,7 @@ class Device(object):
                     break
 
             # extract file contents from output
-            match = re.search('Loading %s (.*)' % src_url, response, re.DOTALL)
+            match = re.search('Loading [^\n]+\n(.*)', response, re.DOTALL)
             if match:
                 result = self._parse_hex(match.group(1), encoding)
                 Logger.dev('Device.load(): leaving returning %d bytes' % len(result))
@@ -517,7 +517,7 @@ class Device(object):
 
             Device.execute('switch %d renumber %d' % (idx, i+1))
             Device.execute('switch %d priority %d' % (idx, max(15-i, 1)))
-            Device.execute('delete flash-%d:nvram_config*' % idx)
+            Device.execute('delete flash-%d:nvram_config' % idx)
 
         Logger.dev('Device.configure_stack_members(): leaving')
 
@@ -755,7 +755,7 @@ class App(object):
         if self._data:
             self._stack_members_configuration()
             self._software_upgrade()
-            # self._process_configuration (sequences -> commands -> configuration file -> commands, ...)
+            self._configuration()
 
             self._save_configuration()
             self._process_reload()
@@ -835,6 +835,45 @@ class App(object):
             return
 
         self._device.upgrade(**data['software'])
+
+    def _configuration(self):
+        data = self._data
+        if 'configuration' not in data:
+            Logger.debug('Configuration JSON data does not provide device'
+                         ' configuration tasks. Skipped...')
+            return
+
+        configuration = data['configuration']
+        tasks = dict(sorted(configuration.items(), key=lambda k: int(k[0])))
+        for key, task in tasks.items():
+            Logger.info('Processing configuration task #%d' % int(key))
+
+            if 'type' not in task:
+                Logger.error('Type is not provided. Skipped...')
+                continue
+
+            task_type = task['type']
+            if (task_type in ['configuration', 'exec']
+                    and 'commands' not in task):
+                Logger.error('No commands specified for %s task. Skipped...' %
+                             task_type)
+                continue
+            if (task_type in ['running-config', 'startup-config']
+                    and 'url' not in task):
+                Logger.error('No url specified for %s task. Skipped...' %
+                             task_type)
+                continue
+
+            if task_type == 'configuration':
+                Device.configure(task['commands'])
+            elif task_type == 'exec':
+                Device.execute(task['commands'])
+            elif task_type == 'running-config':
+                self._device.download(task['url'], 'running-config')
+            elif task_type == 'startup-config':
+                self._device.download(task['url'], 'startup-config')
+            else:
+                Logger.error('No recognized type %s. Skipped...' % task_type)
 
     def _save_configuration(self):
         data = self._data

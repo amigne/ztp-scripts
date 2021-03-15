@@ -64,6 +64,64 @@ Note that both `sha512` and `md5` are optional. When both are missing, no file i
 }
 ```
 
+### Configuration
+The script can apply configuration to the device. This can be set line by line,
+by downloading and applying a configuration to the running-config, by
+downloading and applying a configuration to the startup-config, by executing a
+command, or with a combination of the above.
+
+In order to have the script executing configuration task, the JSON data must
+contain an object named `configuration` (case is important):
+* `configuration`: object indicating the device should perform configuration
+  tasks, the object contains as much entries as the number of distinct
+  successive configuration tasks needed.
+  * task number: Each entry contains a number coded in a string (JSON does not
+    allow keys to be something else than a string) that acts as a sequence 
+    number. Tasks are executed in the ascending order of the sequence numbers
+    (sorted in regards of the numerical comparison). 
+    * `type`: Different types of entries are possible: `configuration` that
+      specifies command(s) to be sent to Cisco IOS-XE CLI configuration mode, 
+      `exec` that specifies commands to be sent to Cisco IOS-XE CLI exec mode, 
+      `running-config` that specifies an URL to be downloaded into the 
+      `running-config` using the CLI `copy` command, and `startup-config` that 
+      specifies an URL to be downloaded into  the `startup-config` using the CLI
+      `copy` command.
+    * `commands`: (for `configuration` and `exec` types only) list with
+      individual commands to be sent to the device in either the configuration
+      or the exec mode.
+    * `url`: (for `running-config` and `startup-config` types only) string with
+      the URL to retrieve the configuration to be copied to either 
+      `running-config` or `startup-config`.
+
+#### Example
+```
+{
+  "configuration": {
+    "1": {
+      "type": "configuration",
+      "commands": [
+        "interface range GigabitEthernet1/0/1-48",
+        "shutdown"
+      ]
+    },
+    "2": {
+      "type": "running-config",
+      "url": "http://10.0.0.1/CONFIG.cfg"
+    },
+    "3": {
+      "type": "startup-config",
+      "url": "http://10.0.0.1/CONFIG.cfg"
+    },
+    "4": {
+      "type": "exec",
+      "commands": [
+        "clear ip ospf 1 process"
+      ]
+    }
+  }
+}
+```
+
 ### Configuration saving
 At the end of the script execution, current configuration can be saved for persisting over reboot.
 
